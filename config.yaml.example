@@ -1,0 +1,14 @@
+bot:
+  token: "ВАШ_ТОКЕН_БОТА" # Получите токен у @BotFather
+  admin_ids: [123456789]  # ID администраторов, можно получить у @userinfobot
+
+database:
+  host: "localhost"  # Адрес сервера базы данных
+  port: 5432         # Порт PostgreSQL
+  user: "postgres"   # Имя пользователя
+  password: "password" # Пароль
+  dbname: "vpnbot"   # Имя базы данных
+  sslmode: "disable" # Режим SSL
+
+payments:
+  provider: "123456789:TEST:abcdefghijklmnopqrstuvwxyz"  # Токен провайдера платежей для Telegram Stars (получите у @BotFather) 

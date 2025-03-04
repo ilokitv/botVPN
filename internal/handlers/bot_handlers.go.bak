@@ -1,0 +1,2059 @@
+package handlers
+
+import (
+	"fmt"
+	"log"
+	"strconv"
+	"strings"
+	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+
+	"github.com/ilokitv/botVPN/internal/config"
+	"github.com/ilokitv/botVPN/internal/database"
+	"github.com/ilokitv/botVPN/internal/models"
+	"github.com/ilokitv/botVPN/internal/vpn"
+)
+
+// BotHandler обрабатывает взаимодействие с Telegram ботом
+type BotHandler struct {
+	bot        *tgbotapi.BotAPI
+	db         *database.DB
+	vpnManager *vpn.WireguardManager
+	config     *config.Config
+	userStates map[int64]UserState
+}
+
+// UserState содержит состояние пользователя в диалоге с ботом
+type UserState struct {
+	State         string
+	Data          map[string]string
+	PreviousState string
+}
+
+// NewBotHandler создает нового обработчика бота
+func NewBotHandler(bot *tgbotapi.BotAPI, db *database.DB, vpnManager *vpn.WireguardManager, cfg *config.Config) *BotHandler {
+	return &BotHandler{
+		bot:        bot,
+		db:         db,
+		vpnManager: vpnManager,
+		config:     cfg,
+		userStates: make(map[int64]UserState),
+	}
+}
+
+// IsAdmin проверяет, является ли пользователь администратором
+func (h *BotHandler) IsAdmin(userID int64) bool {
+	for _, adminID := range h.config.Bot.AdminIDs {
+		if adminID == userID {
+			return true
+		}
+	}
+	return false
+}
+
+// HandleUpdate обрабатывает обновление от Telegram
+func (h *BotHandler) HandleUpdate(update tgbotapi.Update) {
+	// Обрабатываем сообщения
+	if update.Message != nil {
+		// Проверяем на успешный платеж
+		if update.Message.SuccessfulPayment != nil {
+			h.handleSuccessfulPayment(update.Message)
+			return
+		}
+
+		h.handleMessage(update.Message)
+		return
+	}
+
+	// Обрабатываем обратные вызовы (inline keyboard)
+	if update.CallbackQuery != nil {
+		h.handleCallbackQuery(update.CallbackQuery)
+		return
+	}
+
+	// Обрабатываем предварительные запросы на оплату
+	if update.PreCheckoutQuery != nil {
+		h.handlePreCheckoutQuery(update.PreCheckoutQuery)
+		return
+	}
+}
+
+// handleMessage обрабатывает сообщения от пользователя
+func (h *BotHandler) handleMessage(message *tgbotapi.Message) {
+	userID := message.From.ID
+	// Не используем chatID здесь, но она нужна в некоторых методах
+	_ = message.Chat.ID
+
+	// Сохраняем пользователя в базу данных, если это новый пользователь
+	user := &models.User{
+		TelegramID: userID,
+		Username:   message.From.UserName,
+		FirstName:  message.From.FirstName,
+		LastName:   message.From.LastName,
+		IsAdmin:    h.IsAdmin(userID),
+	}
+
+	err := h.db.AddUser(user)
+	if err != nil {
+		log.Printf("Error adding user to database: %v", err)
+	}
+
+	// Обрабатываем команды
+	if message.IsCommand() {
+		h.handleCommand(message)
+		return
+	}
+
+	// Обрабатываем текст в соответствии с текущим состоянием пользователя
+	h.handleStateBasedInput(message)
+}
+
+// handleCommand обрабатывает команды бота
+func (h *BotHandler) handleCommand(message *tgbotapi.Message) {
+	command := message.Command()
+	userID := message.From.ID
+	chatID := message.Chat.ID
+	isAdmin := h.IsAdmin(userID)
+
+	switch command {
+	case "start":
+		h.handleStartCommand(message)
+
+	case "help":
+		h.handleHelpCommand(message)
+
+	case "admin":
+		if isAdmin {
+			h.showAdminMenu(chatID)
+		} else {
+			h.sendMessage(chatID, "У вас нет прав администратора.")
+		}
+
+	case "my":
+		h.handleMySubscriptionsCommand(message)
+
+	case "buy":
+		h.handleBuyCommand(message)
+
+	default:
+		h.sendMessage(chatID, "Неизвестная команда. Используйте /help для получения списка команд.")
+	}
+}
+
+// handleStateBasedInput обрабатывает ввод на основе текущего состояния пользователя
+func (h *BotHandler) handleStateBasedInput(message *tgbotapi.Message) {
+	userID := message.From.ID
+	chatID := message.Chat.ID
+	userState, exists := h.userStates[userID]
+
+	// Проверяем, есть ли у сообщения текст для обработки
+	if message.Text != "" {
+		// Сначала проверяем, не является ли это нажатием на кнопку меню
+		if h.handleMenuButtonPress(message) {
+			return
+		}
+	}
+
+	// Если у пользователя нет активного состояния, выходим
+	if !exists {
+		return
+	}
+
+	switch userState.State {
+	case "add_server_ip":
+		userState.Data["ip"] = message.Text
+		userState.State = "add_server_port"
+		h.userStates[userID] = userState
+		h.sendMessage(chatID, "Введите порт SSH:")
+
+	case "add_server_port":
+		_, err := strconv.Atoi(message.Text) // Используем _ вместо port, но проверяем валидность
+		if err != nil {
+			h.sendMessage(chatID, "Пожалуйста, введите корректный порт (число):")
+			return
+		}
+
+		// Сохраняем порт в данных состояния
+		userState.Data["port"] = message.Text
+
+		// Переходим к следующему шагу
+		h.sendMessage(chatID, "Введите имя пользователя SSH:")
+		userState.State = "add_server_username"
+		h.userStates[userID] = userState
+
+	case "add_server_username":
+		userState.Data["username"] = message.Text
+		userState.State = "add_server_password"
+		h.userStates[userID] = userState
+		h.sendMessage(chatID, "Введите пароль SSH:")
+
+	case "add_server_password":
+		userState.Data["password"] = message.Text
+		userState.State = "add_server_max_clients"
+		h.userStates[userID] = userState
+		h.sendMessage(chatID, "Введите максимальное количество клиентов для сервера:")
+
+	case "add_server_max_clients":
+		maxClients, err := strconv.Atoi(message.Text)
+		if err != nil {
+			h.sendMessage(chatID, "Пожалуйста, введите корректное число клиентов:")
+			return
+		}
+
+		// Добавляем сервер в базу данных
+		portNum, _ := strconv.Atoi(userState.Data["port"])
+		server := &models.Server{
+			IP:          userState.Data["ip"],
+			Port:        portNum,
+			SSHUser:     userState.Data["username"],
+			SSHPassword: userState.Data["password"],
+			MaxClients:  maxClients,
+			IsActive:    true,
+		}
+
+		// Предварительная настройка сервера
+		h.sendMessage(chatID, "Настраиваю сервер, это может занять некоторое время...")
+
+		err = h.vpnManager.SetupServer(server)
+		if err != nil {
+			h.sendMessage(chatID, fmt.Sprintf("Ошибка при настройке сервера: %v", err))
+			delete(h.userStates, userID)
+			return
+		}
+
+		err = h.db.AddServer(server)
+		if err != nil {
+			h.sendMessage(chatID, fmt.Sprintf("Ошибка при добавлении сервера в базу данных: %v", err))
+			delete(h.userStates, userID)
+			return
+		}
+
+		h.sendMessage(chatID, fmt.Sprintf("Сервер успешно добавлен с ID: %d", server.ID))
+		delete(h.userStates, userID)
+
+	// Другие состояния для обработки
+	case "add_plan_name":
+		userState.Data["name"] = message.Text
+		userState.State = "add_plan_description"
+		h.userStates[userID] = userState
+		h.sendMessage(chatID, "Введите описание плана подписки:")
+
+	case "add_plan_description":
+		userState.Data["description"] = message.Text
+		userState.State = "add_plan_price"
+		h.userStates[userID] = userState
+		h.sendMessage(chatID, "Введите цену плана подписки:")
+
+	case "add_plan_price":
+		_, err := strconv.ParseFloat(message.Text, 64) // Используем _ вместо price, но проверяем валидность
+		if err != nil {
+			h.sendMessage(chatID, "Пожалуйста, введите корректную цену:")
+			return
+		}
+
+		// Сохраняем цену в данных состояния
+		userState.Data["price"] = message.Text
+
+		// Переходим к следующему шагу
+		h.sendMessage(chatID, "Введите длительность плана в днях:")
+		userState.State = "add_plan_duration"
+		h.userStates[userID] = userState
+
+	case "add_plan_duration":
+		duration, err := strconv.Atoi(message.Text)
+		if err != nil {
+			h.sendMessage(chatID, "Пожалуйста, введите корректную длительность (число дней):")
+			return
+		}
+
+		// Добавляем план подписки в базу данных
+		priceValue, _ := strconv.ParseFloat(userState.Data["price"], 64)
+		plan := &models.SubscriptionPlan{
+			Name:        userState.Data["name"],
+			Description: userState.Data["description"],
+			Price:       priceValue,
+			Duration:    duration,
+			IsActive:    true,
+		}
+
+		err = h.db.AddSubscriptionPlan(plan)
+		if err != nil {
+			h.sendMessage(chatID, fmt.Sprintf("Ошибка при добавлении плана подписки: %v", err))
+			delete(h.userStates, userID)
+			return
+		}
+
+		h.sendMessage(chatID, fmt.Sprintf("План подписки успешно добавлен: %s", plan.Name))
+		delete(h.userStates, userID)
+
+		// Возвращаемся к списку планов
+		h.listSubscriptionPlans(chatID)
+
+	// Состояния для редактирования плана подписки
+	case "edit_plan_name":
+		if message.Text != "." {
+			userState.Data["new_name"] = message.Text
+		} else {
+			userState.Data["new_name"] = userState.Data["name"]
+		}
+		userState.State = "edit_plan_description"
+		h.userStates[userID] = userState
+		h.sendMessage(chatID, fmt.Sprintf("Введите новое описание плана (или отправьте точку '.' чтобы оставить текущее описание: %s):", userState.Data["description"]))
+
+	case "edit_plan_description":
+		if message.Text != "." {
+			userState.Data["new_description"] = message.Text
+		} else {
+			userState.Data["new_description"] = userState.Data["description"]
+		}
+		userState.State = "edit_plan_price"
+		h.userStates[userID] = userState
+		h.sendMessage(chatID, fmt.Sprintf("Введите новую цену плана (или отправьте точку '.' чтобы оставить текущую цену: %s):", userState.Data["price"]))
+
+	case "edit_plan_price":
+		var err error
+
+		if message.Text != "." {
+			_, err = strconv.ParseFloat(message.Text, 64)
+			if err != nil {
+				h.sendMessage(chatID, "Пожалуйста, введите корректную цену:")
+				return
+			}
+			userState.Data["new_price"] = message.Text
+		} else {
+			userState.Data["new_price"] = userState.Data["price"]
+		}
+
+		userState.State = "edit_plan_duration"
+		h.userStates[userID] = userState
+		h.sendMessage(chatID, fmt.Sprintf("Введите новую длительность плана в днях (или отправьте точку '.' чтобы оставить текущую длительность: %s):", userState.Data["duration"]))
+
+	case "edit_plan_duration":
+		var newDuration int
+		var err error
+
+		if message.Text != "." {
+			newDuration, err = strconv.Atoi(message.Text)
+			if err != nil {
+				h.sendMessage(chatID, "Пожалуйста, введите корректную длительность (число дней):")
+				return
+			}
+			userState.Data["new_duration"] = message.Text
+		} else {
+			userState.Data["new_duration"] = userState.Data["duration"]
+		}
+
+		// Обновляем план подписки в базе данных
+		planID, _ := strconv.Atoi(userState.Data["plan_id"])
+		newPrice, _ := strconv.ParseFloat(userState.Data["new_price"], 64)
+		newDuration, _ = strconv.Atoi(userState.Data["new_duration"])
+
+		plan := &models.SubscriptionPlan{
+			ID:          planID,
+			Name:        userState.Data["new_name"],
+			Description: userState.Data["new_description"],
+			Price:       newPrice,
+			Duration:    newDuration,
+			IsActive:    true,
+		}
+
+		err = h.db.UpdateSubscriptionPlan(plan)
+		if err != nil {
+			h.sendMessage(chatID, fmt.Sprintf("Ошибка при обновлении плана подписки: %v", err))
+			delete(h.userStates, userID)
+			return
+		}
+
+		h.sendMessage(chatID, fmt.Sprintf("План подписки успешно обновлен: %s", plan.Name))
+		delete(h.userStates, userID)
+
+		// Отображаем обновленный план
+		h.viewPlanDetails(chatID, planID)
+
+	default:
+		// Неизвестное состояние
+		delete(h.userStates, userID)
+	}
+}
+
+// handleCallbackQuery обрабатывает нажатия на инлайн-кнопки
+func (h *BotHandler) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
+	chatID := query.Message.Chat.ID
+	data := query.Data
+
+	// Отвечаем на запрос обратного вызова
+	h.bot.Request(tgbotapi.NewCallback(query.ID, ""))
+
+	parts := strings.Split(data, ":")
+	if len(parts) < 2 {
+		return
+	}
+
+	action := parts[0]
+
+	switch action {
+	case "admin_menu":
+		h.handleAdminMenuSelection(chatID, parts[1])
+
+	case "server_action":
+		if len(parts) < 3 {
+			return
+		}
+		serverID, _ := strconv.Atoi(parts[2])
+		h.handleServerAction(chatID, parts[1], serverID)
+
+	case "plan_action":
+		if len(parts) < 3 {
+			return
+		}
+		planID, _ := strconv.Atoi(parts[2])
+		h.handlePlanAction(chatID, parts[1], planID)
+
+	case "user_action":
+		if len(parts) < 3 {
+			return
+		}
+		userID, _ := strconv.Atoi(parts[2])
+		h.handleUserAction(chatID, parts[1], userID)
+
+	case "stats_action":
+		if len(parts) < 3 {
+			return
+		}
+		param, _ := strconv.Atoi(parts[2])
+		h.handleStatsAction(chatID, parts[1], param)
+
+	case "subscription_action":
+		if len(parts) < 3 {
+			return
+		}
+		subscriptionID, _ := strconv.Atoi(parts[2])
+		h.handleSubscriptionAction(chatID, parts[1], subscriptionID)
+
+	case "buy_plan":
+		planID, _ := strconv.Atoi(parts[1])
+		userID := query.From.ID
+		h.handleBuyPlan(chatID, userID, planID)
+
+	case "show_buy_plans":
+		h.listAvailableSubscriptionPlans(chatID)
+	}
+}
+
+// handlePreCheckoutQuery обрабатывает запросы на оплату
+func (h *BotHandler) handlePreCheckoutQuery(query *tgbotapi.PreCheckoutQuery) {
+	// Принимаем оплату
+	config := tgbotapi.PreCheckoutConfig{
+		PreCheckoutQueryID: query.ID,
+		OK:                 true,
+		ErrorMessage:       "",
+	}
+	h.bot.Request(config)
+}
+
+// Обработчики конкретных команд
+
+// handleStartCommand обрабатывает команду /start
+func (h *BotHandler) handleStartCommand(message *tgbotapi.Message) {
+	chatID := message.Chat.ID
+	userID := message.From.ID
+
+	welcomeText := `
+🔒 *Добро пожаловать в VPN бот!*
+
+Этот бот поможет вам приобрести и управлять подписками на VPN-сервис.
+Используйте кнопки меню для быстрого доступа к функциям.
+`
+
+	if h.IsAdmin(userID) {
+		welcomeText += "\nУ вас есть права администратора!"
+	}
+
+	h.sendMainMenu(chatID, welcomeText, userID)
+}
+
+// sendMainMenu отправляет пользователю главное меню с кнопками
+func (h *BotHandler) sendMainMenu(chatID int64, text string, userID int64) {
+	// Создаем красивую клавиатуру с основными функциями
+	keyboard := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("💰 Купить подписку"),
+			tgbotapi.NewKeyboardButton("🔑 Мои подписки"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("ℹ️ Помощь"),
+			tgbotapi.NewKeyboardButton("📞 Поддержка"),
+		),
+	)
+
+	// Для администраторов добавляем отдельную кнопку
+	if h.IsAdmin(userID) {
+		keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("⚙️ Админ-панель"),
+		))
+	}
+
+	// Устанавливаем различные параметры меню
+	keyboard.ResizeKeyboard = true
+	keyboard.OneTimeKeyboard = false
+	keyboard.Selective = false
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	h.bot.Send(msg)
+}
+
+// handleHelpCommand обрабатывает команду /help
+func (h *BotHandler) handleHelpCommand(message *tgbotapi.Message) {
+	chatID := message.Chat.ID
+	userID := message.From.ID
+
+	helpText := `
+*Справка по использованию VPN-бота*
+
+*Основные кнопки меню:*
+• 💰 *Купить подписку* - просмотр и покупка доступных тарифных планов
+• 🔑 *Мои подписки* - управление вашими активными подписками
+• ℹ️ *Помощь* - получение этой справки
+• 📞 *Поддержка* - связь с командой поддержки
+
+*Доступные команды:*
+• /start - отобразить главное меню бота
+• /help - показать эту справку
+• /buy - купить подписку на VPN
+• /my - просмотреть ваши активные подписки
+`
+
+	if h.IsAdmin(userID) {
+		helpText += `
+*Команды администратора:*
+• ⚙️ *Админ-панель* - меню управления ботом
+• /admin - открыть панель администратора
+`
+	}
+
+	msg := tgbotapi.NewMessage(chatID, helpText)
+	msg.ParseMode = "Markdown"
+	h.bot.Send(msg)
+}
+
+// handleMySubscriptionsCommand обрабатывает команду /my
+func (h *BotHandler) handleMySubscriptionsCommand(message *tgbotapi.Message) {
+	chatID := message.Chat.ID
+	userID := message.From.ID
+
+	log.Printf("Обработка команды /my для пользователя %d", userID)
+
+	// Получаем пользователя из базы данных
+	user, err := h.db.GetUserByTelegramID(userID)
+	if err != nil {
+		log.Printf("Ошибка при получении пользователя по TelegramID %d: %v", userID, err)
+		h.sendMessage(chatID, "❌ Ошибка при получении информации о пользователе. Пожалуйста, попробуйте позже.")
+		return
+	}
+
+	log.Printf("Получен пользователь: ID=%d, TelegramID=%d", user.ID, user.TelegramID)
+
+	// Получаем подписки пользователя
+	subscriptions, err := h.db.GetSubscriptionsByUserID(user.ID)
+	if err != nil {
+		log.Printf("Ошибка при получении подписок для пользователя ID=%d: %v", user.ID, err)
+		h.sendMessage(chatID, "❌ Ошибка при получении информации о подписках. Пожалуйста, попробуйте позже.")
+		return
+	}
+
+	log.Printf("Получено %d подписок для пользователя ID=%d", len(subscriptions), user.ID)
+
+	if len(subscriptions) == 0 {
+		// Отправляем красивое сообщение с предложением купить подписку
+		noSubsMsg := `
+*У вас пока нет активных подписок* 🔎
+
+Чтобы начать пользоваться VPN-сервисом:
+1️⃣ Нажмите на кнопку *"💰 Купить подписку"*
+2️⃣ Выберите подходящий тарифный план
+3️⃣ Оплатите подписку через Telegram
+4️⃣ Получите доступ к VPN мгновенно!
+`
+		msg := tgbotapi.NewMessage(chatID, noSubsMsg)
+		msg.ParseMode = "Markdown"
+
+		// Добавляем кнопку для быстрого перехода к покупке
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("💰 Выбрать план подписки", "show_buy_plans"),
+			),
+		)
+		msg.ReplyMarkup = keyboard
+		h.bot.Send(msg)
+		return
+	}
+
+	// Заголовок списка подписок
+	headerMsg := fmt.Sprintf("*🔑 Ваши VPN-подписки (%d)*\n", len(subscriptions))
+	h.sendMessage(chatID, headerMsg)
+
+	// Определяем, является ли пользователь администратором
+	isAdmin := h.IsAdmin(userID)
+
+	// Для каждой подписки формируем отдельную карточку
+	for _, subscription := range subscriptions {
+		// Получаем информацию о сервере
+		server, err := h.db.GetServerByID(subscription.ServerID)
+		if err != nil {
+			log.Printf("Ошибка при получении сервера ID=%d: %v", subscription.ServerID, err)
+			continue
+		}
+
+		// Получаем информацию о плане
+		plan, err := h.db.GetSubscriptionPlanByID(subscription.PlanID)
+		if err != nil {
+			// Если не удалось получить план, используем значение по умолчанию
+			log.Printf("Ошибка при получении плана подписки ID=%d: %v", subscription.PlanID, err)
+			plan = &models.SubscriptionPlan{Name: "План подписки"}
+		} else {
+			log.Printf("Успешно получен план ID=%d: %s", plan.ID, plan.Name)
+		}
+
+		// Выбираем эмодзи в зависимости от статуса
+		var statusEmoji, statusText string
+		switch subscription.Status {
+		case "active":
+			statusEmoji = "✅"
+			statusText = "Активна"
+		case "blocked":
+			statusEmoji = "🔒"
+			statusText = "Заблокирована"
+		case "expired":
+			statusEmoji = "⏱️"
+			statusText = "Истекла"
+		case "revoked":
+			statusEmoji = "❌"
+			statusText = "Отозвана"
+		default:
+			statusEmoji = "❓"
+			statusText = subscription.Status
+		}
+
+		// Вычисляем дни до истечения подписки
+		daysLeft := int(subscription.EndDate.Sub(time.Now()).Hours() / 24)
+		var daysLeftText string
+		if daysLeft > 0 {
+			daysLeftText = fmt.Sprintf("🗓️ *Осталось дней:* %d\n", daysLeft)
+		} else {
+			daysLeftText = "🗓️ *Статус:* Просрочена\n"
+		}
+
+		// Формируем красивое сообщение о подписке
+		infoMsg := fmt.Sprintf(
+			"*VPN-подписка #%d*\n\n"+
+				"%s *Статус:* %s\n"+
+				"📋 *План:* %s\n"+
+				"🌐 *Сервер:* %s\n"+
+				"📅 *Действует до:* %s\n"+
+				"%s"+
+				"📊 *Использовано данных:* %s\n",
+			subscription.ID,
+			statusEmoji, statusText,
+			plan.Name,
+			server.IP,
+			subscription.EndDate.Format("02.01.2006"),
+			daysLeftText,
+			formatBytes(subscription.DataUsage),
+		)
+
+		// Если есть последнее подключение, добавляем эту информацию
+		if subscription.LastConnectionAt != nil && !subscription.LastConnectionAt.IsZero() {
+			infoMsg += fmt.Sprintf("🔄 *Последнее подключение:* %s\n",
+				subscription.LastConnectionAt.Format("02.01.2006 15:04"))
+		}
+
+		// Создаем клавиатуру для этой подписки
+		keyboard := tgbotapi.NewInlineKeyboardMarkup()
+
+		// Основные кнопки для всех пользователей
+		row := tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📄 Конфигурация", fmt.Sprintf("subscription_action:config:%d", subscription.ID)),
+			tgbotapi.NewInlineKeyboardButtonData("📊 Статистика", fmt.Sprintf("subscription_action:stats:%d", subscription.ID)),
+		)
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, row)
+
+		// Если пользователь администратор, добавляем кнопки управления
+		if isAdmin {
+			var adminRow []tgbotapi.InlineKeyboardButton
+
+			// Проверяем текущий статус подписки
+			if subscription.Status == "blocked" {
+				adminRow = tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("🔓 Разблокировать", fmt.Sprintf("subscription_action:unblock:%d", subscription.ID)),
+				)
+			} else {
+				adminRow = tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("🔒 Блокировать", fmt.Sprintf("subscription_action:block:%d", subscription.ID)),
+				)
+			}
+			keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, adminRow)
+		}
+
+		msg := tgbotapi.NewMessage(chatID, infoMsg)
+		msg.ParseMode = "Markdown"
+		msg.ReplyMarkup = keyboard
+		h.bot.Send(msg)
+	}
+
+	// Добавляем кнопку для покупки новой подписки после списка
+	if len(subscriptions) > 0 {
+		buyMoreMsg := "*Хотите добавить еще одну подписку?*"
+		msg := tgbotapi.NewMessage(chatID, buyMoreMsg)
+		msg.ParseMode = "Markdown"
+
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("💰 Купить еще подписку", "show_buy_plans"),
+			),
+		)
+		msg.ReplyMarkup = keyboard
+		h.bot.Send(msg)
+	}
+}
+
+// handleBuyCommand обрабатывает команду /buy
+func (h *BotHandler) handleBuyCommand(message *tgbotapi.Message) {
+	chatID := message.Chat.ID
+	h.listAvailableSubscriptionPlans(chatID)
+}
+
+// showStatsMenu отображает меню статистики
+func (h *BotHandler) showStatsMenu(chatID int64) {
+	text := "Меню статистики. Выберите действие:"
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Общая статистика", "stats_action:overview:0"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Статистика доходов", "stats_action:revenue:0"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Статистика серверов", "stats_action:servers:0"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Назад", "admin_menu:main"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = keyboard
+
+	h.bot.Send(msg)
+}
+
+// handleStatsAction обрабатывает действия в меню статистики
+func (h *BotHandler) handleStatsAction(chatID int64, action string, param int) {
+	switch action {
+	case "overview":
+		h.showSystemStats(chatID)
+
+	case "revenue":
+		h.showRevenueStats(chatID)
+
+	case "servers":
+		h.showServerStats(chatID)
+
+	default:
+		h.sendMessage(chatID, "Неизвестное действие. Пожалуйста, выберите действие из меню.")
+	}
+}
+
+// showSystemStats отображает общую статистику системы
+func (h *BotHandler) showSystemStats(chatID int64) {
+	// Получаем статистику системы
+	stats, err := h.db.GetSystemStats()
+	if err != nil {
+		h.sendMessage(chatID, fmt.Sprintf("Ошибка при получении статистики системы: %v", err))
+		return
+	}
+
+	// Вычисляем процент загрузки серверов
+	var loadPercentage float64
+	if stats.TotalCapacity > 0 {
+		loadPercentage = float64(stats.TotalClients) * 100 / float64(stats.TotalCapacity)
+	}
+
+	text := fmt.Sprintf(
+		"📊 *Общая статистика системы*\n\n"+
+			"👥 *Пользователи:*\n"+
+			"- Всего пользователей: %d\n"+
+			"- Новые пользователи (7 дней): %d\n\n"+
+			"🔑 *Подписки:*\n"+
+			"- Активных подписок: %d\n"+
+			"- Новые подписки (7 дней): %d\n\n"+
+			"💰 *Доходы:*\n"+
+			"- Общий доход: %.2f руб.\n"+
+			"- Доход за 30 дней: %.2f руб.\n\n"+
+			"🖥 *Серверы:*\n"+
+			"- Активных серверов: %d\n"+
+			"- Подключено клиентов: %d\n"+
+			"- Общая вместимость: %d\n"+
+			"- Загрузка серверов: %.1f%%",
+		stats.TotalUsers,
+		stats.NewUsers7Days,
+		stats.ActiveSubscriptions,
+		stats.NewSubscriptions7Days,
+		stats.TotalRevenue,
+		stats.MonthlyRevenue,
+		stats.TotalServers,
+		stats.TotalClients,
+		stats.TotalCapacity,
+		loadPercentage,
+	)
+
+	// Добавляем кнопку возврата
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Назад", "admin_menu:stats"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "HTML"
+	msg.ReplyMarkup = keyboard
+
+	h.bot.Send(msg)
+}
+
+// showRevenueStats отображает статистику доходов
+func (h *BotHandler) showRevenueStats(chatID int64) {
+	// TODO: Реализовать более подробную статистику доходов
+	// Пока просто перенаправляем на общую статистику
+	h.showSystemStats(chatID)
+}
+
+// showServerStats отображает статистику по серверам
+func (h *BotHandler) showServerStats(chatID int64) {
+	// Получаем список серверов
+	servers, err := h.db.GetAllServers()
+	if err != nil {
+		h.sendMessage(chatID, fmt.Sprintf("Ошибка при получении списка серверов: %v", err))
+		return
+	}
+
+	if len(servers) == 0 {
+		h.sendMessage(chatID, "Серверы не найдены.")
+		return
+	}
+
+	text := "📊 *Статистика серверов*\n\n"
+
+	for _, server := range servers {
+		var loadPercentage float64
+		if server.MaxClients > 0 {
+			loadPercentage = float64(server.CurrentClients) * 100 / float64(server.MaxClients)
+		}
+
+		statusEmoji := "✅"
+		if !server.IsActive {
+			statusEmoji = "❌"
+		}
+
+		text += fmt.Sprintf(
+			"🖥 *Сервер #%d* %s\n"+
+				"- IP: `%s`\n"+
+				"- Клиенты: %d/%d (%.1f%%)\n\n",
+			server.ID,
+			statusEmoji,
+			server.IP,
+			server.CurrentClients,
+			server.MaxClients,
+			loadPercentage,
+		)
+	}
+
+	// Добавляем кнопку возврата
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Назад", "admin_menu:stats"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "HTML"
+	msg.ReplyMarkup = keyboard
+
+	h.bot.Send(msg)
+}
+
+// handleSuccessfulPayment обрабатывает успешный платеж через Telegram Stars
+func (h *BotHandler) handleSuccessfulPayment(message *tgbotapi.Message) {
+	userID := message.From.ID
+	chatID := message.Chat.ID
+	payment := message.SuccessfulPayment
+
+	log.Printf("Получен успешный платеж от пользователя %d: %+v", userID, payment)
+
+	// Извлекаем ID плана из InvoicePayload
+	parts := strings.Split(payment.InvoicePayload, ":")
+	if len(parts) != 2 || parts[0] != "plan" {
+		h.sendMessage(chatID, "Ошибка при обработке платежа: неверный формат данных.")
+		return
+	}
+
+	planID, err := strconv.Atoi(parts[1])
+	if err != nil {
+		h.sendMessage(chatID, "Ошибка при обработке платежа: неверный ID плана.")
+		return
+	}
+
+	// Получаем информацию о плане
+	plan, err := h.db.GetSubscriptionPlanByID(planID)
+	if err != nil {
+		h.sendMessage(chatID, fmt.Sprintf("Ошибка при получении информации о плане: %v", err))
+		return
+	}
+
+	// Проверяем доступность серверов
+	servers, err := h.db.GetAllServers()
+	if err != nil {
+		h.sendMessage(chatID, "Ошибка при проверке доступности серверов. Пожалуйста, попробуйте позже.")
+		return
+	}
+
+	var availableServer *models.Server
+	for _, server := range servers {
+		if server.IsActive && server.CurrentClients < server.MaxClients {
+			availableServer = &server
+			break
+		}
+	}
+
+	if availableServer == nil {
+		h.sendMessage(chatID, "К сожалению, в данный момент нет доступных серверов. Пожалуйста, попробуйте позже.")
+		return
+	}
+
+	// Получаем пользователя
+	user, err := h.db.GetUserByTelegramID(userID)
+	if err != nil {
+		h.sendMessage(chatID, "Ошибка при получении информации о пользователе. Пожалуйста, попробуйте позже.")
+		return
+	}
+
+	// Создаем подписку
+	startDate := time.Now()
+	endDate := startDate.AddDate(0, 0, plan.Duration) // Используем длительность из плана
+
+	subscription := &models.Subscription{
+		UserID:    user.ID,
+		ServerID:  availableServer.ID,
+		PlanID:    planID,
+		StartDate: startDate,
+		EndDate:   endDate,
+		Status:    "active",
+	}
+
+	// Проверяем, что сервер правильно настроен
+	err = h.vpnManager.SetupServer(availableServer)
+	if err != nil {
+		h.sendMessage(chatID, fmt.Sprintf("Ошибка при настройке сервера VPN: %v", err))
+		return
+	}
+
+	// Генерируем конфигурационный файл
+	configPath, err := h.vpnManager.CreateClientConfig(availableServer, fmt.Sprintf("user_%d", user.ID))
+	if err != nil {
+		h.sendMessage(chatID, fmt.Sprintf("Ошибка при создании конфигурации VPN: %v", err))
+		return
+	}
+
+	subscription.ConfigFilePath = configPath
+
+	// Сохраняем подписку в базу данных
+	err = h.db.AddSubscription(subscription)
+	if err != nil {
+		h.sendMessage(chatID, fmt.Sprintf("Ошибка при создании подписки: %v", err))
+		return
+	}
+
+	// Создаем запись о платеже
+	paymentRecord := &models.Payment{
+		UserID:         user.ID,
+		SubscriptionID: subscription.ID,
+		Amount:         float64(payment.TotalAmount) / 100.0, // Переводим из копеек в рубли
+		PaymentMethod:  "telegram_stars",
+		PaymentID:      payment.TelegramPaymentChargeID,
+		Status:         "completed",
+	}
+
+	err = h.db.AddPayment(paymentRecord)
+	if err != nil {
+		log.Printf("Ошибка при сохранении платежа в базу данных: %v", err)
+	}
+
+	// Отправляем файл конфигурации пользователю
+	configFile := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(configPath))
+	configFile.Caption = "Вот ваш файл конфигурации VPN. Инструкция по установке в следующем сообщении."
+
+	_, err = h.bot.Send(configFile)
+	if err != nil {
+		h.sendMessage(chatID, fmt.Sprintf("Ошибка при отправке файла конфигурации: %v", err))
+		return
+	}
+
+	// Отправляем инструкцию
+	instructions := `
+*Инструкция по настройке VPN:*
+
+1. Скачайте и установите клиент AmneziaVPN:
+   - для Windows: https://github.com/amnezia-vpn/amnezia-client/releases/download/4.8.3.1/AmneziaVPN_4.8.3.1_x64.exe
+   - для MacOS: https://github.com/amnezia-vpn/amnezia-client/releases/download/4.8.3.1/AmneziaVPN_4.8.3.1_macos.dmg
+   - для iOS: https://apps.apple.com/us/app/amneziavpn/id1600529900
+   - для Android: https://play.google.com/store/apps/details?id=org.amnezia.vpn
+
+2. Откройте клиент AmneziaVPN
+3. Импортируйте полученный файл конфигурации
+4. Активируйте подключение
+
+Готово! Теперь ваш трафик защищен VPN.
+`
+
+	instrMsg := tgbotapi.NewMessage(chatID, instructions)
+	instrMsg.ParseMode = "Markdown"
+
+	h.bot.Send(instrMsg)
+
+	// Отправляем сообщение о успешной покупке
+	successMsg := fmt.Sprintf(
+		"✅ *Подписка успешно оформлена!*\n\n"+
+			"План: %s\n"+
+			"Срок действия: %d дней\n"+
+			"Дата начала: %s\n"+
+			"Дата окончания: %s\n\n"+
+			"Спасибо за покупку!",
+		plan.Name,
+		plan.Duration,
+		startDate.Format("02.01.2006"),
+		endDate.Format("02.01.2006"),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, successMsg)
+	msg.ParseMode = "Markdown"
+	h.bot.Send(msg)
+}
+
+// handleMenuButtonPress обрабатывает нажатия на кнопки основного меню
+func (h *BotHandler) handleMenuButtonPress(message *tgbotapi.Message) bool {
+	text := message.Text
+	chatID := message.Chat.ID
+	userID := message.From.ID
+
+	switch text {
+	case "💰 Купить подписку":
+		h.handleBuyCommand(message)
+		return true
+
+	case "🔑 Мои подписки":
+		h.handleMySubscriptionsCommand(message)
+		return true
+
+	case "ℹ️ Помощь":
+		h.handleHelpCommand(message)
+		return true
+
+	case "📞 Поддержка":
+		supportMsg := `
+*Поддержка VPN-сервиса*
+
+Если у вас возникли вопросы или проблемы с использованием нашего VPN:
+
+
+1. Telegram-канал поддержки: @Demokrat_repablick
+
+Мы всегда рады помочь вам!
+`
+		msg := tgbotapi.NewMessage(chatID, supportMsg)
+		msg.ParseMode = "Markdown"
+		h.bot.Send(msg)
+		return true
+
+	case "⚙️ Админ-панель":
+		// Проверяем, является ли пользователь администратором
+		if h.IsAdmin(userID) {
+			h.showAdminMenu(chatID)
+			return true
+		} else {
+			h.sendMessage(chatID, "У вас нет прав администратора.")
+			return true
+		}
+	}
+
+	return false
+}
+
+// sendMessage отправляет сообщение пользователю
+func (h *BotHandler) sendMessage(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	_, err := h.bot.Send(msg)
+	if err != nil {
+		log.Printf("Ошибка при отправке сообщения: %v", err)
+	}
+}
+
+// formatBytes преобразует байты в удобный для чтения формат (КБ, МБ, ГБ)
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// listAvailableSubscriptionPlans отображает список доступных планов подписки для покупки
+func (h *BotHandler) listAvailableSubscriptionPlans(chatID int64) {
+	// Получаем список активных планов подписки
+	plans, err := h.db.GetAllSubscriptionPlans()
+	if err != nil {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка при получении списка планов: %v", err))
+		h.bot.Send(msg)
+		return
+	}
+
+	// Если нет доступных планов
+	if len(plans) == 0 {
+		msg := tgbotapi.NewMessage(chatID, "В настоящее время нет доступных планов подписки. Пожалуйста, попробуйте позже.")
+		h.bot.Send(msg)
+		return
+	}
+
+	// Отправляем сообщение с заголовком
+	headerMsg := `
+*💰 Выберите план подписки*
+
+Ниже представлены доступные тарифные планы для VPN-подключения.
+Выберите подходящий вариант и нажмите на кнопку для оформления подписки.
+`
+	msg := tgbotapi.NewMessage(chatID, headerMsg)
+	msg.ParseMode = "Markdown"
+	h.bot.Send(msg)
+
+	// Отправляем карточку для каждого плана
+	for _, plan := range plans {
+		// Пропускаем неактивные планы
+		if !plan.IsActive {
+			continue
+		}
+
+		// Создаем красивое сообщение с описанием плана
+		planMsg := fmt.Sprintf(
+			"*%s*\n\n"+
+				"%s\n\n"+
+				"💰 *Цена:* %.2f руб.\n"+
+				"⏳ *Длительность:* %d дней\n"+
+				"💵 *Цена за день:* %.2f руб.",
+			plan.Name,
+			plan.Description,
+			plan.Price,
+			plan.Duration,
+			plan.Price/float64(plan.Duration),
+		)
+
+		// Создаем инлайн-кнопку для покупки
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("💳 Купить", fmt.Sprintf("buy_plan:%d", plan.ID)),
+			),
+		)
+
+		planMsgConfig := tgbotapi.NewMessage(chatID, planMsg)
+		planMsgConfig.ParseMode = "Markdown"
+		planMsgConfig.ReplyMarkup = keyboard
+
+		h.bot.Send(planMsgConfig)
+	}
+
+	// Добавляем кнопку для возврата в меню
+	footerMsg := "*Остались вопросы?*\nСвяжитесь с нашей технической поддержкой."
+	footerMsgConfig := tgbotapi.NewMessage(chatID, footerMsg)
+	footerMsgConfig.ParseMode = "Markdown"
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📞 Поддержка", "https://t.me/Demokrat_repablick"),
+		),
+	)
+	footerMsgConfig.ReplyMarkup = keyboard
+
+	h.bot.Send(footerMsgConfig)
+}
+
+// handleBuyPlan обрабатывает покупку выбранного плана подписки
+func (h *BotHandler) handleBuyPlan(chatID int64, userID int64, planID int) {
+	// Получаем информацию о плане
+	plan, err := h.db.GetSubscriptionPlanByID(planID)
+	if err != nil {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка при получении информации о плане: %v", err))
+		h.bot.Send(msg)
+		return
+	}
+
+	// Проверяем, что план активен
+	if !plan.IsActive {
+		msg := tgbotapi.NewMessage(chatID, "Выбранный план недоступен для покупки.")
+		h.bot.Send(msg)
+		return
+	}
+
+	// Проверяем доступность серверов перед оформлением платежа
+	servers, err := h.db.GetAllServers()
+	if err != nil {
+		msg := tgbotapi.NewMessage(chatID, "Ошибка при проверке доступности серверов. Пожалуйста, попробуйте позже.")
+		h.bot.Send(msg)
+		return
+	}
+
+	var availableServer *models.Server
+	for _, server := range servers {
+		if server.IsActive && server.CurrentClients < server.MaxClients {
+			availableServer = &server
+			break
+		}
+	}
+
+	if availableServer == nil {
+		msg := tgbotapi.NewMessage(chatID, "К сожалению, в данный момент нет доступных серверов. Пожалуйста, попробуйте позже.")
+		h.bot.Send(msg)
+		return
+	}
+
+	// Создаем платежный инвойс
+	priceInPennies := int(plan.Price * 100) // Переводим в копейки
+	invoice := tgbotapi.NewInvoice(
+		chatID,
+		fmt.Sprintf("VPN-подписка: %s", plan.Name),
+		fmt.Sprintf("Подписка на VPN-сервис длительностью %d дней", plan.Duration),
+		fmt.Sprintf("plan:%d", planID), // Payload для идентификации плана
+		h.config.Payments.Provider,
+		"RUB", // Валюта
+		"RUB", // Валюта параметра провайдера
+		[]tgbotapi.LabeledPrice{
+			{
+				Label:  plan.Name,
+				Amount: priceInPennies,
+			},
+		},
+	)
+
+	// Настраиваем дополнительные параметры инвойса
+	invoice.PhotoURL = "https://www.example.com/vpn-logo.jpg" // Опционально: URL изображения
+	invoice.NeedName = true
+	invoice.NeedEmail = true
+	invoice.SendEmailToProvider = true
+	invoice.IsFlexible = false
+	invoice.DisableNotification = false
+
+	// Отправляем запрос на оплату
+	_, err = h.bot.Send(invoice)
+	if err != nil {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка при создании счета для оплаты: %v", err))
+		h.bot.Send(msg)
+		return
+	}
+
+	// Сообщение с инструкцией по оплате
+	paymentInstructions := `
+*Инструкция по оплате:*
+
+1. Нажмите кнопку "Оплатить" в отправленном счете
+2. Выберите способ оплаты
+3. Следуйте инструкциям для завершения оплаты
+4. После успешной оплаты вы получите конфигурационный файл и инструкции по настройке VPN
+
+В случае возникновения проблем с оплатой, обратитесь в службу поддержки.
+`
+	instructionMsg := tgbotapi.NewMessage(chatID, paymentInstructions)
+	instructionMsg.ParseMode = "Markdown"
+	h.bot.Send(instructionMsg)
+}
+
+// showAdminMenu отображает меню администратора
+func (h *BotHandler) showAdminMenu(chatID int64) {
+	text := "🔧 *Меню администратора*\n\nВыберите действие:"
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🖥️ Управление серверами", "admin_menu:servers"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📑 Управление планами", "admin_menu:plans"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👥 Управление пользователями", "admin_menu:users"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📊 Статистика", "admin_menu:stats"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+
+	h.bot.Send(msg)
+}
+
+// handleAdminMenuSelection обрабатывает выбор в меню администратора
+func (h *BotHandler) handleAdminMenuSelection(chatID int64, selection string) {
+	switch selection {
+	case "main":
+		// Возвращаемся в главное меню администратора
+		h.showAdminMenu(chatID)
+
+	case "servers":
+		// Показываем список серверов
+		servers, err := h.db.GetAllServers()
+		if err != nil {
+			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка при получении списка серверов: %v", err))
+			h.bot.Send(msg)
+			return
+		}
+
+		if len(servers) == 0 {
+			keyboard := tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("➕ Добавить сервер", "server_action:add:0"),
+				),
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", "admin_menu:main"),
+				),
+			)
+
+			msg := tgbotapi.NewMessage(chatID, "Серверы не найдены. Добавьте новый сервер.")
+			msg.ReplyMarkup = keyboard
+			h.bot.Send(msg)
+			return
+		}
+
+		// Отправляем заголовок
+		headerMsg := tgbotapi.NewMessage(chatID, "*Список серверов*\n\nВыберите сервер для управления:")
+		headerMsg.ParseMode = "Markdown"
+		h.bot.Send(headerMsg)
+
+		// Отправляем информацию о каждом сервере
+		for _, server := range servers {
+			status := "🟢 Активен"
+			if !server.IsActive {
+				status = "🔴 Неактивен"
+			}
+
+			serverMsg := fmt.Sprintf(
+				"*Сервер #%d*\n"+
+					"IP: `%s:%d`\n"+
+					"Клиенты: %d / %d\n"+
+					"Статус: %s",
+				server.ID,
+				server.IP,
+				server.Port,
+				server.CurrentClients,
+				server.MaxClients,
+				status,
+			)
+
+			keyboard := tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("📝 Редактировать", fmt.Sprintf("server_action:edit:%d", server.ID)),
+					tgbotapi.NewInlineKeyboardButtonData("🔍 Детали", fmt.Sprintf("server_action:view:%d", server.ID)),
+				),
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("❌ Удалить", fmt.Sprintf("server_action:delete:%d", server.ID)),
+				),
+			)
+
+			msg := tgbotapi.NewMessage(chatID, serverMsg)
+			msg.ParseMode = "Markdown"
+			msg.ReplyMarkup = keyboard
+			h.bot.Send(msg)
+		}
+
+		// Добавляем кнопки для создания нового сервера и возврата в меню
+		footerKeyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("➕ Добавить сервер", "server_action:add:0"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", "admin_menu:main"),
+			),
+		)
+
+		footerMsg := tgbotapi.NewMessage(chatID, "Действия с серверами:")
+		footerMsg.ReplyMarkup = footerKeyboard
+		h.bot.Send(footerMsg)
+
+	case "plans":
+		// Показываем список планов подписки
+		h.listSubscriptionPlans(chatID)
+
+	case "users":
+		// Показываем список пользователей
+		users, err := h.db.GetAllUsers()
+		if err != nil {
+			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка при получении списка пользователей: %v", err))
+			h.bot.Send(msg)
+			return
+		}
+
+		if len(users) == 0 {
+			keyboard := tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", "admin_menu:main"),
+			h.bot.Send(msg)
+			return
+		headerMsg := tgbotapi.NewMessage(chatID, "*Список пользователей*\n\nВыберите пользователя для управления:")
+		headerMsg.ParseMode = "Markdown"
+		h.bot.Send(headerMsg)
+
+		// Отправляем информацию о каждом пользователе (ограничиваем вывод 10 пользователями)
+		count := 0
+		for _, user := range users {
+			if count >= 10 {
+				break
+			}
+
+			admin := ""
+			if user.IsAdmin {
+				admin = "👑 Администратор"
+			}
+
+			name := user.Username
+			if name == "" {
+				name = fmt.Sprintf("%s %s", user.FirstName, user.LastName)
+			}
+
+			userMsg := fmt.Sprintf(
+				"*Пользователь #%d*\n"+
+					"Имя: %s\n"+
+					"Telegram ID: `%d`\n"+
+					"%s",
+				user.ID,
+				name,
+				user.TelegramID,
+			)
+
+			keyboard := tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("🔍 Подписки", fmt.Sprintf("user_action:subscriptions:%d", user.ID)),
+				),
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("👑 Сделать админом", fmt.Sprintf("user_action:make_admin:%d", user.ID)),
+				),
+			)
+
+			msg := tgbotapi.NewMessage(chatID, userMsg)
+			msg.ParseMode = "Markdown"
+			msg.ReplyMarkup = keyboard
+			h.bot.Send(msg)
+
+			count++
+		}
+
+		// Добавляем кнопку для возврата в меню
+		footerKeyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", "admin_menu:main"),
+			),
+		)
+
+		footerMsg := tgbotapi.NewMessage(chatID, "Всего пользователей: "+fmt.Sprint(len(users)))
+		footerMsg.ReplyMarkup = footerKeyboard
+		h.bot.Send(footerMsg)
+
+	case "stats":
+		// Показываем меню статистики
+		h.showStatsMenu(chatID)
+	}
+}
+
+// listSubscriptionPlans отображает список планов подписки для администратора
+func (h *BotHandler) listSubscriptionPlans(chatID int64) {
+	// Получаем все планы подписки
+	plans, err := h.db.GetAllSubscriptionPlans()
+	if err != nil {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка при получении списка планов: %v", err))
+		h.bot.Send(msg)
+		return
+	}
+
+	if len(plans) == 0 {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("➕ Добавить план", "plan_action:add:0"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", "admin_menu:main"),
+			),
+		)
+
+		msg := tgbotapi.NewMessage(chatID, "Планы подписки не найдены. Добавьте новый план.")
+		msg.ReplyMarkup = keyboard
+		h.bot.Send(msg)
+		return
+	}
+
+	// Отправляем заголовок
+	headerMsg := tgbotapi.NewMessage(chatID, "*Список планов подписки*\n\nВыберите план для управления:")
+	headerMsg.ParseMode = "Markdown"
+	h.bot.Send(headerMsg)
+
+	// Отправляем информацию о каждом плане
+	for _, plan := range plans {
+		status := "🟢 Активен"
+		if !plan.IsActive {
+			status = "🔴 Неактивен"
+		}
+
+		planMsg := fmt.Sprintf(
+			"*%s*\n"+
+				"%s\n"+
+				"Цена: %.2f руб.\n"+
+				"Длительность: %d дней\n"+
+				"Статус: %s",
+			plan.Name,
+			plan.Description,
+			plan.Price,
+			plan.Duration,
+			status,
+		)
+
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("📝 Редактировать", fmt.Sprintf("plan_action:edit:%d", plan.ID)),
+				tgbotapi.NewInlineKeyboardButtonData("🔍 Детали", fmt.Sprintf("plan_action:view:%d", plan.ID)),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("❌ Удалить", fmt.Sprintf("plan_action:delete:%d", plan.ID)),
+			),
+		)
+
+		msg := tgbotapi.NewMessage(chatID, planMsg)
+		msg.ParseMode = "Markdown"
+		msg.ReplyMarkup = keyboard
+		h.bot.Send(msg)
+	}
+
+	// Добавляем кнопки для создания нового плана и возврата в меню
+	footerKeyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("➕ Добавить план", "plan_action:add:0"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", "admin_menu:main"),
+		),
+	)
+
+	footerMsg := tgbotapi.NewMessage(chatID, "Действия с планами:")
+	footerMsg.ReplyMarkup = footerKeyboard
+	h.bot.Send(footerMsg)
+}
+
+// viewPlanDetails отображает подробную информацию о плане подписки
+func (h *BotHandler) viewPlanDetails(chatID int64, planID int) {
+	// Получаем информацию о плане
+	plan, err := h.db.GetSubscriptionPlanByID(planID)
+	if err != nil {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка при получении информации о плане: %v", err))
+		h.bot.Send(msg)
+		return
+	}
+
+	if plan == nil {
+		msg := tgbotapi.NewMessage(chatID, "План подписки не найден.")
+		h.bot.Send(msg)
+		return
+	}
+
+	// Получаем количество активных подписок на этот план
+	// Предполагаем, что у нас нет метода GetActiveSubscriptionCountByPlanID,
+	// поэтому будем просто показывать "Недоступно"
+	activeSubscriptions := "Недоступно"
+
+	// Получаем общее количество подписок на этот план
+	// Предполагаем, что у нас нет метода GetTotalSubscriptionCountByPlanID,
+	// поэтому будем просто показывать "Недоступно"
+	totalSubscriptions := "Недоступно"
+
+	status := "🟢 Активен"
+	if !plan.IsActive {
+		status = "🔴 Неактивен"
+	}
+
+	// Формируем сообщение с подробной информацией
+	planMsg := fmt.Sprintf(
+		"*Детали плана подписки*\n\n"+
+			"*ID:* `%d`\n"+
+			"*Название:* %s\n"+
+			"*Описание:* %s\n"+
+			"*Цена:* %.2f руб.\n"+
+			"*Длительность:* %d дней\n"+
+			"*Статус:* %s\n"+
+			"*Активных подписок:* %s\n"+
+			"*Всего подписок:* %s\n"+
+			"*Создан:* %s\n"+
+			"*Обновлен:* %s",
+		plan.ID,
+		plan.Name,
+		plan.Description,
+		plan.Price,
+		plan.Duration,
+		status,
+		activeSubscriptions,
+		totalSubscriptions,
+		plan.CreatedAt.Format("02.01.2006 15:04:05"),
+		plan.UpdatedAt.Format("02.01.2006 15:04:05"),
+	)
+
+	// Кнопки для управления планом
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📝 Редактировать", fmt.Sprintf("plan_action:edit:%d", plan.ID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ Удалить", fmt.Sprintf("plan_action:delete:%d", plan.ID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔙 К списку планов", "admin_menu:plans"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, planMsg)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = keyboard
+	h.bot.Send(msg)
+}
+
+// handlePlanAction обрабатывает действия с планами подписки
+func (h *BotHandler) handlePlanAction(chatID int64, action string, planID int) {
+	switch action {
+	case "view":
+		// Показываем детали плана
+		h.viewPlanDetails(chatID, planID)
+
+	case "edit":
+		// Начинаем процесс редактирования плана
+		plan, err := h.db.GetSubscriptionPlanByID(planID)
+		if err != nil {
+			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка при получении информации о плане: %v", err))
+			h.bot.Send(msg)
+			return
+		}
+
+		if plan == nil {
+			msg := tgbotapi.NewMessage(chatID, "План подписки не найден.")
+			h.bot.Send(msg)
+			return
+		}
+
+		// Сохраняем ID плана в состоянии пользователя
+		// Примечание: предполагается, что у нас нет метода SaveUserState,
+		// поэтому мы просто отправляем сообщение о необходимости его реализации
+		msg := tgbotapi.NewMessage(chatID, "Функция редактирования плана в разработке.")
+		h.bot.Send(msg)
+
+		// Возвращаемся к просмотру деталей плана
+		h.viewPlanDetails(chatID, planID)
+
+	case "delete":
+		// Запрашиваем подтверждение удаления плана
+		plan, err := h.db.GetSubscriptionPlanByID(planID)
+		if err != nil {
+			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка при получении информации о плане: %v", err))
+			h.bot.Send(msg)
+			return
+		}
+
+		if plan == nil {
+			msg := tgbotapi.NewMessage(chatID, "План подписки не найден.")
+			h.bot.Send(msg)
+			return
+		}
+
+		confirmMsg := fmt.Sprintf(
+			"Вы действительно хотите удалить план *%s*?\n\n"+
+				"⚠️ Внимание: Это действие не повлияет на существующие подписки, но сделает план недоступным для покупки новым пользователям.",
+			plan.Name,
+		)
+
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("✅ Да, удалить", fmt.Sprintf("plan_action:confirm_delete:%d", planID)),
+				tgbotapi.NewInlineKeyboardButtonData("❌ Отмена", "admin_menu:plans"),
+			),
+		)
+
+		msg := tgbotapi.NewMessage(chatID, confirmMsg)
+		msg.ParseMode = "Markdown"
+		msg.ReplyMarkup = keyboard
+		h.bot.Send(msg)
+
+	case "confirm_delete":
+		// Удаляем план подписки
+		if err := h.db.DeleteSubscriptionPlan(planID); err != nil {
+			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка при удалении плана: %v", err))
+			h.bot.Send(msg)
+			return
+		}
+
+		msg := tgbotapi.NewMessage(chatID, "✅ План подписки успешно удален.")
+		h.bot.Send(msg)
+
+		// Возвращаемся к списку планов
+		h.listSubscriptionPlans(chatID)
+
+	case "add":
+		// Начинаем процесс добавления нового плана
+		// Примечание: предполагается, что у нас нет метода SaveUserState,
+		// поэтому мы просто отправляем сообщение о необходимости его реализации
+		msg := tgbotapi.NewMessage(chatID, "Функция добавления плана в разработке.")
+		h.bot.Send(msg)
+
+		// Возвращаемся к списку планов
+		h.listSubscriptionPlans(chatID)
+
+	default:
+		msg := tgbotapi.NewMessage(chatID, "Неизвестное действие с планом.")
+		h.bot.Send(msg)
+	}
+}
+
+// handleServerAction обрабатывает действия с серверами
+func (h *BotHandler) handleServerAction(chatID int64, action string, serverID int) {
+	// Заглушка для метода handleServerAction
+	msg := tgbotapi.NewMessage(chatID, "Функция управления серверами в разработке.")
+	h.bot.Send(msg)
+}
+
+// handleSubscriptionAction обрабатывает действия с подписками
+func (h *BotHandler) handleSubscriptionAction(chatID int64, action string, subscriptionID int) {
+	// Получаем информацию о подписке
+	subscription, err := h.db.GetSubscriptionByID(subscriptionID)
+	if err != nil {
+		log.Printf("Ошибка при получении информации о подписке #%d: %v", subscriptionID, err)
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка: не удалось найти подписку #%d", subscriptionID))
+		h.bot.Send(msg)
+		return
+	}
+
+	// Получаем информацию о пользователе
+	user, err := h.db.GetUserByID(subscription.UserID)
+	if err != nil {
+		log.Printf("Ошибка при получении информации о пользователе #%d: %v", subscription.UserID, err)
+		msg := tgbotapi.NewMessage(chatID, "Ошибка: не удалось найти пользователя подписки")
+		h.bot.Send(msg)
+		return
+	}
+
+	// Получаем информацию о плане
+	plan, err := h.db.GetSubscriptionPlanByID(subscription.PlanID)
+	if err != nil {
+		log.Printf("Ошибка при получении информации о плане #%d: %v", subscription.PlanID, err)
+		msg := tgbotapi.NewMessage(chatID, "Ошибка: не удалось найти план подписки")
+		h.bot.Send(msg)
+		return
+	}
+
+	// Получаем сервер
+	server, err := h.db.GetServerByID(subscription.ServerID)
+	if err != nil {
+		log.Printf("Ошибка при получении информации о сервере #%d: %v", subscription.ServerID, err)
+		msg := tgbotapi.NewMessage(chatID, "Ошибка: не удалось найти сервер подписки")
+		h.bot.Send(msg)
+		return
+	}
+
+	var responseText string
+
+	switch action {
+	case "block":
+		// Проверяем, заблокирована ли уже подписка
+		isBlocked, err := h.vpnManager.IsClientBlocked(server, subscription.ConfigFilePath)
+		if err != nil {
+			log.Printf("Ошибка при проверке статуса блокировки подписки #%d: %v", subscriptionID, err)
+			msg := tgbotapi.NewMessage(chatID, "Ошибка при проверке статуса подписки")
+			h.bot.Send(msg)
+			return
+		}
+
+		if isBlocked {
+			responseText = fmt.Sprintf("Подписка #%d пользователя %s уже заблокирована",
+				subscriptionID, user.Username)
+		} else {
+			// Блокируем подписку
+			err = h.vpnManager.BlockClient(server, subscription.ConfigFilePath)
+			if err != nil {
+				log.Printf("Ошибка при блокировке подписки #%d: %v", subscriptionID, err)
+				msg := tgbotapi.NewMessage(chatID, "Ошибка при блокировке подписки")
+				h.bot.Send(msg)
+				return
+			}
+
+			// Отправляем уведомление пользователю
+			userMsg := fmt.Sprintf("❗ Ваша подписка #%d (%s) была заблокирована администратором. Обратитесь в поддержку для получения дополнительной информации.",
+				subscriptionID, plan.Name)
+			notificationMsg := tgbotapi.NewMessage(user.TelegramID, userMsg)
+			h.bot.Send(notificationMsg)
+
+			responseText = fmt.Sprintf("✅ Подписка #%d пользователя %s успешно заблокирована",
+				subscriptionID, user.Username)
+		}
+
+	case "unblock":
+		// Проверяем, заблокирована ли подписка
+		isBlocked, err := h.vpnManager.IsClientBlocked(server, subscription.ConfigFilePath)
+		if err != nil {
+			log.Printf("Ошибка при проверке статуса блокировки подписки #%d: %v", subscriptionID, err)
+			msg := tgbotapi.NewMessage(chatID, "Ошибка при проверке статуса подписки")
+			h.bot.Send(msg)
+			return
+		}
+
+		if !isBlocked {
+			responseText = fmt.Sprintf("Подписка #%d пользователя %s не заблокирована",
+				subscriptionID, user.Username)
+		} else {
+			// Разблокируем подписку
+			err = h.vpnManager.UnblockClient(server, subscription.ConfigFilePath)
+			if err != nil {
+				log.Printf("Ошибка при разблокировке подписки #%d: %v", subscriptionID, err)
+				msg := tgbotapi.NewMessage(chatID, "Ошибка при разблокировке подписки")
+				h.bot.Send(msg)
+				return
+			}
+
+			// Отправляем уведомление пользователю
+			userMsg := fmt.Sprintf("✅ Ваша подписка #%d (%s) была разблокирована. VPN-соединение снова доступно.",
+				subscriptionID, plan.Name)
+			notificationMsg := tgbotapi.NewMessage(user.TelegramID, userMsg)
+			h.bot.Send(notificationMsg)
+
+			responseText = fmt.Sprintf("✅ Подписка #%d пользователя %s успешно разблокирована",
+				subscriptionID, user.Username)
+		}
+
+	case "delete":
+		// Отзываем конфигурацию VPN
+		err = h.vpnManager.RevokeClientConfig(server, subscription.ConfigFilePath)
+		if err != nil {
+			log.Printf("Ошибка при отзыве конфигурации VPN для подписки #%d: %v", subscriptionID, err)
+			msg := tgbotapi.NewMessage(chatID, "Ошибка при удалении подписки")
+			h.bot.Send(msg)
+			return
+		}
+
+		// Обновляем статус подписки
+		subscription.Status = "revoked"
+		err = h.db.UpdateSubscription(subscription)
+		if err != nil {
+			log.Printf("Ошибка при обновлении статуса подписки #%d: %v", subscriptionID, err)
+			msg := tgbotapi.NewMessage(chatID, "Ошибка при обновлении статуса подписки")
+			h.bot.Send(msg)
+			return
+		}
+
+		// Обновляем счетчик клиентов на сервере
+		server.CurrentClients -= 1
+		if server.CurrentClients < 0 {
+			server.CurrentClients = 0
+		}
+		err = h.db.UpdateServer(server)
+		if err != nil {
+			log.Printf("Ошибка при обновлении счетчика клиентов сервера #%d: %v", server.ID, err)
+		}
+
+		// Отправляем уведомление пользователю
+		userMsg := fmt.Sprintf("❗ Ваша подписка #%d (%s) была удалена администратором. VPN-соединение больше недоступно.",
+			subscriptionID, plan.Name)
+		notificationMsg := tgbotapi.NewMessage(user.TelegramID, userMsg)
+		h.bot.Send(notificationMsg)
+
+		responseText = fmt.Sprintf("✅ Подписка #%d пользователя %s успешно удалена",
+			subscriptionID, user.Username)
+
+	default:
+		responseText = fmt.Sprintf("Неизвестное действие для подписки #%d", subscriptionID)
+	}
+
+	// Отправляем ответ администратору
+	msg := tgbotapi.NewMessage(chatID, responseText)
+	h.bot.Send(msg)
+}
+
+// handleUserAction обрабатывает действия с пользователями
+func (h *BotHandler) handleUserAction(chatID int64, action string, userID int) {
+	// Получаем информацию о пользователе
+	user, err := h.db.GetUserByID(userID)
+	if err != nil {
+		log.Printf("Ошибка при получении информации о пользователе #%d: %v", userID, err)
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка: не удалось найти пользователя #%d", userID))
+		h.bot.Send(msg)
+		return
+	}
+
+	switch action {
+	case "subscriptions":
+		// Получаем подписки пользователя
+		subscriptions, err := h.db.GetSubscriptionsByUserID(userID)
+		if err != nil {
+			log.Printf("Ошибка при получении подписок пользователя #%d: %v", userID, err)
+			msg := tgbotapi.NewMessage(chatID, "Ошибка при получении подписок пользователя")
+			h.bot.Send(msg)
+			return
+		}
+
+		if len(subscriptions) == 0 {
+			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("У пользователя %s нет подписок", user.Username))
+			h.bot.Send(msg)
+			return
+		}
+
+		// Формируем сообщение с подписками
+		messageText := fmt.Sprintf("📋 Подписки пользователя %s:\n\n", user.Username)
+
+		for i, subscription := range subscriptions {
+			// Получаем план подписки
+			plan, err := h.db.GetSubscriptionPlanByID(subscription.PlanID)
+			if err != nil {
+				log.Printf("Ошибка при получении плана #%d: %v", subscription.PlanID, err)
+				continue
+			}
+
+			// Определяем статус подписки
+			var statusEmoji string
+			switch subscription.Status {
+			case "active":
+				statusEmoji = "✅"
+			case "expired":
+				statusEmoji = "⏱"
+			case "revoked":
+				statusEmoji = "❌"
+			default:
+				statusEmoji = "❓"
+			}
+
+			// Проверяем, заблокирована ли подписка
+			blockedStatus := ""
+			if subscription.Status == "active" && subscription.ConfigFilePath != "" {
+				server, err := h.db.GetServerByID(subscription.ServerID)
+				if err == nil {
+					isBlocked, err := h.vpnManager.IsClientBlocked(server, subscription.ConfigFilePath)
+					if err == nil && isBlocked {
+						blockedStatus = " [🔒 заблокирована]"
+					}
+				}
+			}
+
+			// Форматируем дату
+			endDateStr := subscription.EndDate.Format("02.01.2006")
+
+			// Добавляем информацию о подписке
+			messageText += fmt.Sprintf("%d. #%d - %s %s%s\n   План: %s\n   Дата окончания: %s\n\n",
+				i+1, subscription.ID, statusEmoji, subscription.Status, blockedStatus, plan.Name, endDateStr)
+		}
+
+		// Создаем клавиатуру с действиями для подписок
+		var keyboardButtons [][]tgbotapi.InlineKeyboardButton
+
+		for _, subscription := range subscriptions {
+			// Если подписка активна, добавляем кнопки для блокировки/разблокировки и удаления
+			if subscription.Status == "active" {
+				// Проверяем, заблокирована ли подписка
+				server, err := h.db.GetServerByID(subscription.ServerID)
+				isBlocked := false
+				if err == nil && subscription.ConfigFilePath != "" {
+					isBlocked, _ = h.vpnManager.IsClientBlocked(server, subscription.ConfigFilePath)
+				}
+
+				var actionButton tgbotapi.InlineKeyboardButton
+				if isBlocked {
+					actionButton = tgbotapi.NewInlineKeyboardButtonData(
+						fmt.Sprintf("🔓 Разблокировать #%d", subscription.ID),
+						fmt.Sprintf("subscription_action:unblock:%d", subscription.ID),
+					)
+				} else {
+					actionButton = tgbotapi.NewInlineKeyboardButtonData(
+						fmt.Sprintf("🔒 Заблокировать #%d", subscription.ID),
+						fmt.Sprintf("subscription_action:block:%d", subscription.ID),
+					)
+				}
+
+				// Добавляем кнопку блокировки/разблокировки
+				keyboardButtons = append(keyboardButtons, []tgbotapi.InlineKeyboardButton{actionButton})
+
+				// Добавляем кнопку удаления
+				deleteButton := tgbotapi.NewInlineKeyboardButtonData(
+					fmt.Sprintf("❌ Удалить #%d", subscription.ID),
+					fmt.Sprintf("subscription_action:delete:%d", subscription.ID),
+				)
+				keyboardButtons = append(keyboardButtons, []tgbotapi.InlineKeyboardButton{deleteButton})
+			}
+		}
+
+		// Добавляем кнопку "Назад"
+		backButton := tgbotapi.NewInlineKeyboardButtonData("🔙 Назад", "admin_menu:users")
+		keyboardButtons = append(keyboardButtons, []tgbotapi.InlineKeyboardButton{backButton})
+
+		// Создаем клавиатуру
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(keyboardButtons...)
+
+		// Отправляем сообщение с подписками и клавиатурой
+		msg := tgbotapi.NewMessage(chatID, messageText)
+		msg.ReplyMarkup = keyboard
+		h.bot.Send(msg)
+
+	case "make_admin":
+		// Назначаем пользователя администратором
+		err = h.db.SetUserAdmin(userID, true)
+		if err != nil {
+			log.Printf("Ошибка при назначении пользователя #%d администратором: %v", userID, err)
+			msg := tgbotapi.NewMessage(chatID, "Ошибка при назначении пользователя администратором")
+			h.bot.Send(msg)
+			return
+		}
+
+		// Отправляем уведомление пользователю
+		userMsg := "✅ Вам были предоставлены права администратора в боте. Теперь вы имеете доступ к дополнительным функциям. Используйте команду /admin для доступа к панели администратора."
+		notificationMsg := tgbotapi.NewMessage(user.TelegramID, userMsg)
+		h.bot.Send(notificationMsg)
+
+		// Отправляем ответ администратору
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Пользователь %s успешно назначен администратором", user.Username))
+		h.bot.Send(msg)
+
+	case "remove_admin":
+		// Снимаем права администратора
+		err = h.db.SetUserAdmin(userID, false)
+		if err != nil {
+			log.Printf("Ошибка при снятии прав администратора у пользователя #%d: %v", userID, err)
+			msg := tgbotapi.NewMessage(chatID, "Ошибка при снятии прав администратора")
+			h.bot.Send(msg)
+			return
+		}
+
+		// Отправляем уведомление пользователю
+		userMsg := "❗ Ваши права администратора в боте были отозваны."
+		notificationMsg := tgbotapi.NewMessage(user.TelegramID, userMsg)
+		h.bot.Send(notificationMsg)
+
+		// Отправляем ответ администратору
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Права администратора успешно сняты с пользователя %s", user.Username))
+		h.bot.Send(msg)
+
+	default:
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Неизвестное действие для пользователя #%d", userID))
+		h.bot.Send(msg)
+	}
+}

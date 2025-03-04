@@ -1,0 +1,26 @@
+# Скомпилированные файлы
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Конфигурационные файлы 
+/config*.yaml
+!config.yaml.example
+
+# Папка с конфигурациями VPN
+/vpn_configs/
+
+# Тестовые данные
+*.test
+*.tmp
+
+# Директории и файлы среды разработки
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Зависимости
+/vendor/ 

@@ -1,0 +1,1 @@
+Решение: Изменить в файле internal/handlers/bot_handlers.go в функции listUsersWithSubscriptions msg.ParseMode = "Markdown" на msg.ParseMode = "HTML" и адаптировать форматирование
